@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sync"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
@@ -33,13 +35,16 @@ type Request struct {
 
 // ToPod will portforward to given pod.
 func ToPod(req Request) error {
+	const pfLifetime = 10 * time.Minute
+
+	// Build SPDY round tripper/dialer from RestConfig
 	transport, upgrader, err := spdy.RoundTripperFor(req.RestConfig)
 	if err != nil {
 		return err
 	}
 
-	logr := NewLogger()
-	klog.Infof("start port-forward %d->%d", req.LocalPort, req.PodPort)
+	img := findImageForPort(req.Pod, req.PodPort)
+	klog.Infof("start port-forward %s/%s [%s] %d->%d", req.Pod.Namespace, req.Pod.Name, img, req.LocalPort, req.PodPort)
 
 	url, err := getURLScheme(req)
 	if err != nil {
@@ -47,7 +52,25 @@ func ToPod(req Request) error {
 	}
 
 	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, url)
-	fw, err := portforward.New(dialer, []string{fmt.Sprintf("%d:%d", req.LocalPort, req.PodPort)}, req.StopCh, req.ReadyCh, logr, logr)
+
+	// Enforce a hard lifetime while still honoring external StopCh
+	localStop := make(chan struct{})
+	var once sync.Once
+	closeLocal := func() { once.Do(func() { close(localStop) }) }
+
+	go func() {
+		select {
+		case <-req.StopCh:
+			closeLocal()
+		case <-time.After(pfLifetime):
+			klog.Warningf("port-forward: killed after lifetime limit [%d->%d]", req.LocalPort, req.PodPort)
+			closeLocal()
+		}
+	}()
+
+	ports := []string{fmt.Sprintf("%d:%d", req.LocalPort, req.PodPort)}
+	logr := NewLogger()
+	fw, err := portforward.New(dialer, ports, localStop, req.ReadyCh, logr, logr)
 	if err != nil {
 		return err
 	}
@@ -69,4 +92,20 @@ func getURLScheme(req Request) (*url.URL, error) {
 	}
 
 	return &url.URL{Scheme: base.Scheme, Host: base.Host, Path: path.Join(base.Path, portfw)}, nil
+}
+
+// findImageForPort tries to locate the image of the container that exposes the given port.
+// If none match, falls back to the first container (if any).
+func findImageForPort(pod v1.Pod, port int) string {
+	for _, c := range pod.Spec.Containers {
+		for _, p := range c.Ports {
+			if int(p.ContainerPort) == port {
+				return c.Image
+			}
+		}
+	}
+	if len(pod.Spec.Containers) > 0 {
+		return pod.Spec.Containers[0].Image
+	}
+	return "<unknown>"
 }
